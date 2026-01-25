@@ -1,0 +1,287 @@
+import os
+import time
+import re
+from urllib.parse import urljoin, urlparse
+from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
+
+class KnowledgeCrawler:
+    def __init__(self):
+        self.visited_urls = set()
+        self.chapters = []  # List to store (title, html_content)
+        self.word_count = 0
+        self.MAX_WORDS = 500000
+        
+        # CSS to inject into the final PDF for clean formatting
+        self.pdf_css = """
+        <style>
+            body { font-family: sans-serif; line-height: 1.6; color: #333; }
+            h1, h2, h3 { color: #005fb2; margin-top: 30px; }
+            h1 { border-bottom: 2px solid #005fb2; padding-bottom: 10px; page-break-before: always; }
+            pre, code { background-color: #f4f6f8; font-family: 'Courier New', Courier, monospace; padding: 2px 4px; border-radius: 4px; }
+            pre { padding: 15px; overflow-x: auto; border: 1px solid #d8dde6; }
+            img { max-width: 100%; height: auto; display: block; margin: 20px auto; }
+            a { color: #005fb2; text-decoration: none; }
+            .chapter-meta { font-size: 0.8em; color: #666; margin-bottom: 20px; }
+        </style>
+        """
+
+    def clean_url(self, url):
+        """Removes anchors (#section) to ensure uniqueness."""
+        return url.split('#')[0]
+
+    def expand_sidebar(self, page):
+        """
+        Attempts to find and click expandable arrows in the sidebar/TOC.
+        Targeting common accordion patterns used in documentation.
+        """
+        print(" -> Attempting to expand sidebar menus...")
+        try:
+            # Look for common sidebar selectors
+            sidebar = page.locator("nav, [role='navigation'], .sidebar, #sidebar")
+            if not sidebar.count():
+                return
+
+            # Loop a few times to handle nested levels
+            for _ in range(3): 
+                # Find buttons/icons that usually indicate collapsed state
+                # Salesforce specific: slds-tree__item, aria-expanded="false"
+                expanders = sidebar.locator("button[aria-expanded='false'], .slds-tree__item button")
+                
+                count = expanders.count()
+                if count == 0:
+                    break
+                    
+                for i in range(count):
+                    try:
+                        # Only click if visible to avoid errors
+                        if expanders.nth(i).is_visible():
+                            expanders.nth(i).click(timeout=1000)
+                            # Small delay to let JS render sub-items
+                            time.sleep(0.2) 
+                    except:
+                        pass
+                
+                # Wait for network idle after a batch of clicks
+                page.wait_for_load_state("networkidle", timeout=2000)
+        except Exception as e:
+            print(f"    ! Warning during sidebar expansion: {e}")
+
+    def get_child_links(self, page, parent_url):
+        """
+        Extracts links from the navigation/sidebar area.
+        """
+        print(" -> Scanning sidebar for child chapters...")
+        links = []
+        
+        # 1. Expand menus first
+        self.expand_sidebar(page)
+
+        # 2. Extract hrefs from the sidebar area only
+        # We try specific selectors first, then fall back to generic
+        selectors = ["nav a", "[role='navigation'] a", ".sidebar a", ".doc-toc-container a"]
+        
+        found_elements = []
+        for sel in selectors:
+            if page.locator(sel).count() > 0:
+                found_elements = page.locator(sel).all()
+                break
+        
+        for elem in found_elements:
+            try:
+                href = elem.get_attribute("href")
+                if href:
+                    full_url = urljoin(parent_url, href)
+                    clean = self.clean_url(full_url)
+                    
+                    # Ensure we stay on the same domain/doc section
+                    if urlparse(parent_url).netloc in clean:
+                        if clean not in links:
+                            links.append(clean)
+            except:
+                continue
+                
+        # If no sidebar links found, strictly return just the parent (single page crawl)
+        if not links:
+            print("    ! No sidebar links found. Crawling single page only.")
+            return [parent_url]
+            
+        return links
+
+    def parse_page_content(self, page, url):
+        """
+        Extracts the title and main body HTML from a page.
+        """
+        try:
+            # Wait for specific Salesforce/Doc selectors to ensure content loaded
+            # 'article', '[role="main"]', '#main-content' are standard
+            page.wait_for_selector("article, [role='main'], h1", state="visible", timeout=15000)
+        except:
+            print(f"    ! Timeout waiting for content on: {url}")
+
+        # Get the full HTML to parse with BeautifulSoup
+        content_html = page.content()
+        soup = BeautifulSoup(content_html, 'html.parser')
+
+        # 1. Identify Main Content
+        # Priority order for finding the main content
+        main_content = soup.find('main') or \
+                       soup.find('article') or \
+                       soup.find(role='main') or \
+                       soup.find(id='main-content') or \
+                       soup.find(class_='doc-content')
+
+        if not main_content:
+            return None, 0
+
+        # 2. Extract Title
+        title_tag = main_content.find('h1')
+        title = title_tag.get_text(strip=True) if title_tag else "Untitled Chapter"
+
+        # 3. Clean up the content (remove scripts, buttons, navs inside content)
+        for tag in main_content(['script', 'style', 'button', 'nav', 'iframe']):
+            tag.decompose()
+
+        # 4. Handle Images (Convert relative URLs to absolute)
+        for img in main_content.find_all('img'):
+            if img.get('src'):
+                img['src'] = urljoin(url, img['src'])
+                # Optional: Remove lazy loading attributes that might hide images in PDF
+                if img.get('loading'): del img['loading']
+                if img.get('srcset'): del img['srcset']
+
+        # 5. Get HTML string
+        html_str = str(main_content)
+        
+        # Calculate rough word count
+        text_content = main_content.get_text()
+        words = len(text_content.split())
+
+        return {
+            'title': title,
+            'url': url,
+            'html': html_str
+        }, words
+
+    def create_pdf(self, output_path, browser):
+        """
+        Compiles all crawled HTML into one file and prints to PDF using Playwright.
+        """
+        print(f"\nGeneratig PDF at: {output_path} ...")
+        
+        # Create a combined HTML string
+        combined_html = f"<html><head>{self.pdf_css}</head><body>"
+        
+        # Add Title Page
+        combined_html += f"""
+        <div style="text-align: center; padding-top: 200px;">
+            <h1 style="font-size: 48px; border: none;">Documentation Export</h1>
+            <p>Source: {self.chapters[0]['url']}</p>
+            <p>Generated on: {time.strftime('%Y-%m-%d')}</p>
+        </div>
+        <div style="page-break-after: always;"></div>
+        """
+        
+        # Add Table of Contents
+        combined_html += "<h1>Table of Contents</h1><ul>"
+        for i, chapter in enumerate(self.chapters):
+            combined_html += f"<li><a href='#chap{i}'>{chapter['title']}</a></li>"
+        combined_html += "</ul><div style="page-break-after: always;"></div>"
+
+        # Add Chapters
+        for i, chapter in enumerate(self.chapters):
+            combined_html += f"<div id='chap{i}'>"
+            # Add a Chapter Header if the H1 isn't already at the top
+            combined_html += f"<div class='chapter-meta'>Source: {chapter['url']}</div>"
+            combined_html += chapter['html']
+            combined_html += "</div><div style='page-break-after: always;'></div>"
+        
+        combined_html += "</body></html>"
+
+        # Save to temp file
+        temp_html_path = os.path.abspath("temp_guide.html")
+        with open(temp_html_path, "w", encoding="utf-8") as f:
+            f.write(combined_html)
+
+        # Use Playwright to render the PDF
+        # We create a new page to render the local file
+        page = browser.new_page()
+        page.goto(f"file:///{temp_html_path}")
+        
+        # Wait specifically for images to load in the local file
+        page.wait_for_load_state("networkidle")
+        
+        page.pdf(path=output_path, format="A4", margin={"top": "2cm", "bottom": "2cm", "left": "2cm", "right": "2cm"}, print_background=True)
+        
+        # Cleanup
+        page.close()
+        if os.path.exists(temp_html_path):
+            os.remove(temp_html_path)
+        
+        print("Success! PDF created.")
+
+    def run(self):
+        # 1. Inputs
+        parent_url = input("Enter the Parent URL: ").strip()
+        save_dir = input("Enter the folder path to save the PDF (e.g., C:/Users/Docs): ").strip()
+        
+        # Ensure filename ends in PDF
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+        output_path = os.path.join(save_dir, "Documentation_Export.pdf")
+
+        with sync_playwright() as p:
+            # Launch Browser (Headless=True is faster, but False helps debugging anti-bot)
+            browser = p.chromium.launch(headless=False)
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            )
+            page = context.new_page()
+
+            print(f"\nNavigating to Parent URL: {parent_url}")
+            page.goto(parent_url, timeout=60000)
+            page.wait_for_load_state("domcontentloaded")
+            
+            # Allow dynamic content to settle (Salesforce is heavy)
+            time.sleep(3)
+
+            # 2. Get Links (Table of Contents)
+            urls_to_crawl = self.get_child_links(page, parent_url)
+            print(f"Found {len(urls_to_crawl)} pages to crawl.")
+
+            # 3. Crawl Pages
+            for i, url in enumerate(urls_to_crawl):
+                if self.word_count >= self.MAX_WORDS:
+                    print("Max word count reached. Stopping crawl.")
+                    break
+                
+                print(f"[{i+1}/{len(urls_to_crawl)}] Parsing: {url}")
+                try:
+                    page.goto(url, timeout=60000)
+                    # Handle Salesforce loading
+                    page.wait_for_load_state("domcontentloaded")
+                    time.sleep(2) # Grace period for dynamic hydration
+                    
+                    data, count = self.parse_page_content(page, url)
+                    
+                    if data:
+                        self.chapters.append(data)
+                        self.word_count += count
+                        print(f"    + Added '{data['title']}' (~{count} words)")
+                    else:
+                        print("    - Skipped (No content found)")
+                        
+                except Exception as e:
+                    print(f"    ! Error parsing page: {e}")
+
+            # 4. Generate PDF
+            if self.chapters:
+                self.create_pdf(output_path, context)
+            else:
+                print("No content extracted.")
+
+            browser.close()
+
+if __name__ == "__main__":
+    crawler = KnowledgeCrawler()
+    crawler.run()
