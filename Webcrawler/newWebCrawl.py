@@ -186,7 +186,7 @@ class KnowledgeCrawler:
         combined_html += "<h1>Table of Contents</h1><ul>"
         for i, chapter in enumerate(self.chapters):
             combined_html += f"<li><a href='#chap{i}'>{chapter['title']}</a></li>"
-        combined_html += "</ul><div style="page-break-after: always;"></div>"
+        combined_html += '</ul><div style="page-break-after: always;"></div>'
 
         # Add Chapters
         for i, chapter in enumerate(self.chapters):
